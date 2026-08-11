@@ -2096,7 +2096,19 @@ function applySingleAgentLaunchDefaults(params: SubagentParamsLike, agents: Agen
 
 export const DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000;
 
-function resolveForegroundTimeout(params: SubagentParamsLike, defaultTimeoutMs?: number): { timeoutMs?: number; error?: string } {
+// Async single-agent runs also need a wall-clock backstop: a child whose bash
+// tool blocks forever (e.g. a background process inheriting the terminal with
+// no bash `timeout` arg) would otherwise hang the parent indefinitely with
+// zero signal. Same generous default as foreground; explicit timeoutMs/
+// maxRuntimeMs and agent-level defaultTimeoutMs remain authoritative.
+//
+// Deliberately NOT applied at the workflow level: async scripted workflows
+// stay unbounded as a whole (matching the existing design intent), while
+// every child inside them is individually bounded by this default via the
+// single-agent launch path.
+export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
+
+export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTimeoutMs?: number): { timeoutMs?: number; error?: string } {
 	const rawTimeout = params.timeoutMs;
 	const rawMaxRuntime = params.maxRuntimeMs;
 	if (rawTimeout === undefined && rawMaxRuntime === undefined) {
@@ -2113,6 +2125,24 @@ function resolveForegroundTimeout(params: SubagentParamsLike, defaultTimeoutMs?:
 	}
 	const timeoutMs = rawTimeout ?? rawMaxRuntime;
 	return timeoutMs === undefined ? {} : { timeoutMs };
+}
+
+/**
+ * Resolve the effective launch timeout for a single-agent run, applying the
+ * async/foreground default when neither the caller nor the agent set one.
+ *
+ * The async default is deliberately applied ONLY to plain single-agent
+ * launches (no chain/parallel/workflow). Composite launches (chain, parallel
+ * tasks, workflowScript) keep their top-level execution unbounded when no
+ * timeout is set — each child inside them is individually bounded via
+ * applySingleAgentLaunchDefaults, and a top-level deadline must never preempt
+ * a child with a longer agent-level timeout.
+ * Exported so the executor wiring is directly testable.
+ */
+export function resolveSingleAgentLaunchTimeout(params: SubagentParamsLike, async: boolean): { timeoutMs?: number; error?: string } {
+	const isComposite = (params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || params.workflowScript !== undefined;
+	const defaultTimeoutMs = !async ? DEFAULT_FOREGROUND_TIMEOUT_MS : isComposite ? undefined : DEFAULT_ASYNC_TIMEOUT_MS;
+	return resolveForegroundTimeout(params, defaultTimeoutMs);
 }
 
 function resolveToolBudget(
@@ -5450,9 +5480,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (externalAgent && (!effectiveAsync || effectiveParams.foregroundOnly === true)) {
 			return buildRequestedModeError(effectiveParams, `Agent '${externalAgent.name}' uses runner.type='external-cli', which currently supports async/background execution only. Omit async or pass async:true; clarify and foregroundOnly are unsupported.`);
 		}
-		const foregroundTimeout = resolveForegroundTimeout(
+		const foregroundTimeout = resolveSingleAgentLaunchTimeout(
 			effectiveParams,
-			effectiveAsync ? undefined : DEFAULT_FOREGROUND_TIMEOUT_MS,
+			effectiveAsync,
 		);
 		if (foregroundTimeout.error) return buildRequestedModeError(effectiveParams, foregroundTimeout.error);
 		const controlConfig = resolveControlConfig(deps.config.control, effectiveParams.control);
