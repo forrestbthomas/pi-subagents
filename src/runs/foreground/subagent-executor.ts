@@ -51,7 +51,7 @@ import {
 	type StepOverrides,
 } from "../../shared/settings.ts";
 import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skills.ts";
-import { buildAsyncRunnerSteps, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable, workflowAwaitedAsyncResultPath } from "../background/async-execution.ts";
+import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable, workflowAwaitedAsyncResultPath } from "../background/async-execution.ts";
 import { isScheduledRunAction, type ScheduledRunAction } from "../background/scheduled-runs.ts";
 import { enqueueChainAppendRequest, readPendingChainAppendRequests, runnerStepOutputNames } from "../background/chain-append.ts";
 import { ChainOutputValidationError, validateChainOutputBindingsWithContext } from "../shared/chain-outputs.ts";
@@ -2103,10 +2103,8 @@ export const DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000;
 // maxRuntimeMs and agent-level defaultTimeoutMs remain authoritative.
 //
 // Deliberately NOT applied at the workflow level: async scripted workflows
-// stay unbounded as a whole (matching the existing design intent), while
-// every child inside them is individually bounded by this default via the
-// single-agent launch path.
-export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
+// stay unbounded as a whole, while each runner child has its own deadline.
+export { DEFAULT_ASYNC_TIMEOUT_MS };
 
 export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTimeoutMs?: number): { timeoutMs?: number; error?: string } {
 	const rawTimeout = params.timeoutMs;
@@ -2131,12 +2129,9 @@ export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTime
  * Resolve the effective launch timeout for a single-agent run, applying the
  * async/foreground default when neither the caller nor the agent set one.
  *
- * The async default is deliberately applied ONLY to plain single-agent
- * launches (no chain/parallel/workflow). Composite launches (chain, parallel
- * tasks, workflowScript) keep their top-level execution unbounded when no
- * timeout is set — each child inside them is individually bounded via
- * applySingleAgentLaunchDefaults, and a top-level deadline must never preempt
- * a child with a longer agent-level timeout.
+ * The async default is deliberately applied only to plain single-agent
+ * launches. Composite launches keep their top-level execution unbounded when
+ * no timeout is set; their runner children resolve separate deadlines.
  * Exported so the executor wiring is directly testable.
  */
 export function resolveSingleAgentLaunchTimeout(params: SubagentParamsLike, async: boolean): { timeoutMs?: number; error?: string } {
