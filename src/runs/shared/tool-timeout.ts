@@ -1,38 +1,49 @@
-/**
- * Per-tool-call timeout resolution (opt-in).
- *
- * Bounds a single subagent tool call inside the child event loops (async:
- * runPiStreaming; foreground: runSync). The knob is OPT-IN: when nothing is
- * configured anywhere the feature is off (undefined), so legit long tools
- * (installs, tests, migrations) and legit blocking tools (contact_supervisor,
- * intercom) are unaffected unless the caller opts in.
- *
- * Precedence ladder: per-call param > agent frontmatter > global config >
- * environment (PI_SUBAGENT_TOOL_TIMEOUT_MS). The env value is the lowest-tier
- * global default so hosts like pi-harness get a zero-config hook while any
- * explicit call/agent/config value still wins.
- *
- * Validation mirrors resolveConfigDefaultTimeoutMs: the value must be a
- * positive integer and must not exceed MAX_TIMER_DELAY_MS (values above the
- * 32-bit signed integer ceiling overflow setTimeout and fire almost
- * immediately). Invalid values are rejected with an error, not silently
- * ignored, so a misconfigured knob is visible to the caller.
- */
-
 export const TOOL_TIMEOUT_ENV = "PI_SUBAGENT_TOOL_TIMEOUT_MS";
 
-/** Maximum delay a Node.js timer accepts (32-bit signed integer ceiling). */
+/** Maximum delay a Node.js timer accepts without overflow. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-/**
- * Tools that legitimately block on a human or supervisor decision. A blanket
- * per-tool deadline would kill these waits; they stay bounded by their own
- * mechanisms (e.g. DEFAULT_ASK_TIMEOUT_MS) and the run-level deadline.
- */
-export const TOOL_TIMEOUT_ALLOWLIST = new Set(["contact_supervisor", "intercom"]);
+export const DEFAULT_FAST_TOOL_TIMEOUT_MS = 300_000;
+
+export const DEFAULT_FAST_TOOL_TIMEOUT_TOOLS = new Set([
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"edit",
+	"write",
+	"structured_output",
+]);
+
+/** Tools whose normal job can be to wait for a person or another run. */
+export const TOOL_TIMEOUT_EXEMPT_TOOLS = new Set(["contact_supervisor", "intercom", "subagent_wait"]);
+
+// Backward-compatible export name for existing callers/tests.
+export const TOOL_TIMEOUT_ALLOWLIST = TOOL_TIMEOUT_EXEMPT_TOOLS;
 
 export function isToolTimeoutExempt(toolName: string | undefined): boolean {
-	return toolName !== undefined && TOOL_TIMEOUT_ALLOWLIST.has(toolName);
+	return toolName !== undefined && TOOL_TIMEOUT_EXEMPT_TOOLS.has(toolName);
+}
+
+export function defaultToolTimeoutMs(toolName: string | undefined): number | undefined {
+	return toolName !== undefined && DEFAULT_FAST_TOOL_TIMEOUT_TOOLS.has(toolName)
+		? DEFAULT_FAST_TOOL_TIMEOUT_MS
+		: undefined;
+}
+
+export function effectiveToolTimeoutMs(toolName: string | undefined, configuredToolTimeoutMs: number | undefined): number | undefined {
+	if (isToolTimeoutExempt(toolName)) return undefined;
+	return configuredToolTimeoutMs ?? defaultToolTimeoutMs(toolName);
+}
+
+export function formatToolTimeoutMessage(toolName: string, timeoutMs: number): string {
+	return `Tool '${toolName}' exceeded its timeout of ${timeoutMs}ms.`;
+}
+
+export function toolTimeoutCallKey(event: { toolCallId?: unknown; toolName?: unknown }, fallbackId: number): string {
+	return typeof event.toolCallId === "string" && event.toolCallId.length > 0
+		? `id:${event.toolCallId}`
+		: `anon:${String(event.toolName ?? "tool")}:${fallbackId}`;
 }
 
 export interface ToolTimeoutResolutionInput {
@@ -46,11 +57,7 @@ export interface ToolTimeoutResolutionInput {
 	envValue?: string | undefined;
 }
 
-/**
- * Resolve the effective opt-in per-tool-call timeout. Returns undefined when
- * nothing is configured (feature off). Returns an error string for an invalid
- * value at the winning tier.
- */
+/** Resolve the configured hard timeout. Default fast-tool timeouts apply later per tool name. */
 export function resolveToolTimeoutMs(input: ToolTimeoutResolutionInput): { toolTimeoutMs?: number; error?: string } {
 	const candidates: Array<{ label: string; value: unknown }> = [
 		{ label: "toolTimeoutMs", value: input.callValue },
@@ -72,10 +79,7 @@ export function resolveToolTimeoutMs(input: ToolTimeoutResolutionInput): { toolT
 	let parsed: number;
 	if (winner.label === TOOL_TIMEOUT_ENV && typeof raw === "string") {
 		parsed = Number(raw);
-		if (raw.trim() !== "" && !Number.isNaN(parsed)) {
-			// Accept a plain integer string (e.g. "60000").
-			raw = parsed;
-		}
+		if (raw.trim() !== "" && !Number.isNaN(parsed)) raw = parsed;
 	}
 	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > MAX_TIMER_DELAY_MS) {
 		return { error: `${winner.label} must be a positive integer no larger than ${MAX_TIMER_DELAY_MS}.` };

@@ -41,7 +41,7 @@ export interface RunnerSubagentStep {
 	sessionFile?: string;
 	maxSubagentDepth?: number;
 	timeoutMs?: number;
-	/** Resolved opt-in per-tool-call timeout (ms). Off (undefined) by default. */
+	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
 	toolTimeoutMs?: number;
 	waitToolEnabled?: boolean;
 	structuredOutput?: {

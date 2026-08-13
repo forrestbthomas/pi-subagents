@@ -1,15 +1,21 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+	DEFAULT_FAST_TOOL_TIMEOUT_MS,
+	DEFAULT_FAST_TOOL_TIMEOUT_TOOLS,
 	TOOL_TIMEOUT_ALLOWLIST,
 	TOOL_TIMEOUT_ENV,
+	defaultToolTimeoutMs,
+	effectiveToolTimeoutMs,
+	formatToolTimeoutMessage,
 	isToolTimeoutExempt,
 	resolveToolTimeoutMs,
+	toolTimeoutCallKey,
 	toolTimeoutFromEnv,
 } from "../../src/runs/shared/tool-timeout.ts";
 
 describe("resolveToolTimeoutMs", () => {
-	it("is off (undefined) when nothing is configured anywhere", () => {
+	it("has no configured hard timeout when nothing is configured anywhere", () => {
 		assert.deepEqual(resolveToolTimeoutMs({}), {});
 	});
 
@@ -44,7 +50,6 @@ describe("resolveToolTimeoutMs", () => {
 			assert.ok(r.error, `expected error for ${String(bad)}`);
 			assert.match(r.error!, /positive integer/);
 		}
-		// Above the 32-bit signed integer ceiling setTimeout would overflow.
 		const huge = resolveToolTimeoutMs({ callValue: 2_147_483_648 });
 		assert.ok(huge.error);
 		assert.match(huge.error!, /no larger than/);
@@ -55,20 +60,42 @@ describe("resolveToolTimeoutMs", () => {
 	});
 });
 
-describe("isToolTimeoutExempt", () => {
-	it("exempts supervisor tools that legitimately block on a human", () => {
-		for (const tool of ["contact_supervisor", "intercom"]) {
-			assert.equal(isToolTimeoutExempt(tool), true, `${tool} must be exempt`);
+describe("effectiveToolTimeoutMs", () => {
+	it("uses a default hard timeout only for known-fast tools", () => {
+		for (const tool of ["read", "grep", "find", "ls", "edit", "write", "structured_output"]) {
+			assert.equal(defaultToolTimeoutMs(tool), DEFAULT_FAST_TOOL_TIMEOUT_MS, tool);
+			assert.equal(effectiveToolTimeoutMs(tool, undefined), DEFAULT_FAST_TOOL_TIMEOUT_MS, tool);
 		}
+		assert.equal(defaultToolTimeoutMs("bash"), undefined);
+		assert.equal(effectiveToolTimeoutMs("bash", undefined), undefined);
+		assert.deepEqual([...DEFAULT_FAST_TOOL_TIMEOUT_TOOLS].sort(), ["edit", "find", "grep", "ls", "read", "structured_output", "write"]);
 	});
 
-	it("does not exempt regular tools", () => {
+	it("lets an explicit configured timeout win for non-exempt tools", () => {
+		assert.equal(effectiveToolTimeoutMs("bash", 1234), 1234);
+		assert.equal(effectiveToolTimeoutMs("read", 1234), 1234);
+	});
+
+	it("never applies a tool timeout to blocking coordination tools", () => {
+		for (const tool of ["contact_supervisor", "intercom", "subagent_wait"]) {
+			assert.equal(isToolTimeoutExempt(tool), true, `${tool} must be exempt`);
+			assert.equal(effectiveToolTimeoutMs(tool, 1234), undefined);
+			assert.equal(effectiveToolTimeoutMs(tool, undefined), undefined);
+		}
 		assert.equal(isToolTimeoutExempt("bash"), false);
 		assert.equal(isToolTimeoutExempt(undefined), false);
+		assert.deepEqual([...TOOL_TIMEOUT_ALLOWLIST].sort(), ["contact_supervisor", "intercom", "subagent_wait"]);
+	});
+});
+
+describe("tool timeout formatting and keys", () => {
+	it("formats timeout errors consistently", () => {
+		assert.equal(formatToolTimeoutMessage("bash", 1000), "Tool 'bash' exceeded its timeout of 1000ms.");
 	});
 
-	it("allowlist contains exactly the supervisor pair", () => {
-		assert.deepEqual([...TOOL_TIMEOUT_ALLOWLIST].sort(), ["contact_supervisor", "intercom"]);
+	it("uses toolCallId when present and falls back to an anonymous sequence", () => {
+		assert.equal(toolTimeoutCallKey({ toolCallId: "call-1", toolName: "read" }, 9), "id:call-1");
+		assert.equal(toolTimeoutCallKey({ toolName: "read" }, 9), "anon:read:9");
 	});
 });
 

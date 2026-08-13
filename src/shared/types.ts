@@ -215,7 +215,7 @@ export interface ControlEvent {
 	nestedRunId?: string;
 	nestingPath?: NestedRunAddress["path"];
 	message: string;
-	reason?: "idle" | "completion_guard" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold";
+	reason?: "idle" | "completion_guard" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
 	turns?: number;
 	tokens?: number;
 	toolCount?: number;
@@ -1945,10 +1945,10 @@ export interface ExtensionConfig {
 	 */
 	timeoutMs?: number;
 	/**
-	 * Optional per-tool-call timeout in milliseconds (opt-in). Bounds a single
+	 * Optional hard per-tool-call timeout in milliseconds. Bounds a single
 	 * subagent tool call inside the child; the run-level timeout remains
-	 * authoritative. Off (undefined) by default so legit long or blocking tools
-	 * are unaffected. Precedence: call param > agent frontmatter > this config >
+	 * authoritative. Known-fast built-in tools have a five-minute default when
+	 * this is undefined. Precedence: call param > agent frontmatter > this config >
 	 * PI_SUBAGENT_TOOL_TIMEOUT_MS. Must be a positive integer; invalid values
 	 * are rejected with an error.
 	 */

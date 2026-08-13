@@ -175,7 +175,7 @@ interface AsyncChainParams {
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
 	configToolBudget?: ResolvedToolBudget;
-	/** Per-call toolTimeoutMs (highest precedence; off when undefined). */
+	/** Optional per-call hard toolTimeoutMs override (highest precedence). */
 	callToolTimeoutMs?: number;
 	/** Global config.toolTimeoutMs (third precedence, after agent frontmatter). */
 	configToolTimeoutMs?: number;
@@ -232,7 +232,7 @@ interface AsyncSingleParams {
 	acceptance?: AcceptanceInput;
 	timeoutMs?: number;
 	absoluteDeadlineAt?: number;
-	/** Per-call toolTimeoutMs (highest precedence; off when undefined). */
+	/** Optional per-call hard toolTimeoutMs override (highest precedence). */
 	toolTimeoutMs?: number;
 	turnBudget?: { maxTurns: number; graceTurns?: number };
 	toolBudget?: ResolvedToolBudget | ToolBudgetConfig;
@@ -280,7 +280,7 @@ export interface AsyncRunnerStepBuildParams {
 	validateOutputBindings?: boolean;
 	toolBudget?: ResolvedToolBudget;
 	configToolBudget?: ResolvedToolBudget;
-	/** Per-call toolTimeoutMs from the subagent invocation (highest precedence). */
+	/** Optional per-call hard toolTimeoutMs override from the subagent invocation. */
 	callToolTimeoutMs?: number;
 	/** Global config.toolTimeoutMs (third precedence, after agent frontmatter). */
 	configToolTimeoutMs?: number;

@@ -552,7 +552,7 @@ interface ChainExecutionParams {
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
 	configToolBudget?: ToolBudgetConfig;
-	/** Per-call toolTimeoutMs (highest precedence; off when undefined). */
+	/** Optional per-call hard toolTimeoutMs override (highest precedence). */
 	callToolTimeoutMs?: number;
 	/** Global config.toolTimeoutMs (third precedence, after agent frontmatter). */
 	configToolTimeoutMs?: number;

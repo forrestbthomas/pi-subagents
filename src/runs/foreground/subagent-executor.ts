@@ -307,7 +307,7 @@ export interface SubagentParamsLike {
 	foregroundOnly?: boolean;
 	timeoutMs?: number;
 	maxRuntimeMs?: number;
-	/** Opt-in per-tool-call timeout (ms). Bounds a single tool call inside the child. */
+	/** Optional hard per-tool-call timeout (ms). Known-fast tools also have a default. */
 	toolTimeoutMs?: number;
 	turnBudget?: TurnBudgetConfig;
 	/** Internal-only strict turn-boundary enforcement for versioned foreground delegation. */

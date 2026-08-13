@@ -57,6 +57,7 @@ import {
 	claimControlNotification,
 	formatControlIntercomMessage,
 	formatControlNoticeMessage,
+	shouldEmitOpenToolAttention,
 } from "../shared/subagent-control.ts";
 import {
 	type RunnerSubagentStep as SubagentStep,
@@ -126,7 +127,7 @@ import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
-import { isToolTimeoutExempt } from "../shared/tool-timeout.ts";
+import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { usageBudgetExceededMessage, usageBudgetState } from "../shared/usage-budget.ts";
 import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup, writePendingParallelHandoff } from "../shared/parallel-handoff.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
@@ -177,7 +178,7 @@ interface SubagentRunConfig {
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 	timeoutMs?: number;
 	deadlineAt?: number;
-	/** Resolved opt-in per-tool-call timeout (ms) for this run; off when undefined. */
+	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
 	toolTimeoutMs?: number;
 	turnBudget?: ResolvedTurnBudget;
 	toolBudget?: ResolvedToolBudget;
@@ -680,27 +681,13 @@ function runPiStreaming(
 			onChildEvent?.(event);
 
 			if (event.type === "tool_execution_end") {
-				clearToolTimeoutTimer();
+				clearActiveToolTimeout(event);
 				return;
 			}
 
 			if (event.type === "tool_execution_start" && event.toolName) {
 				toolCount += 1;
-				clearToolTimeoutTimer();
-				if (toolTimeoutMs !== undefined && !isToolTimeoutExempt(event.toolName)) {
-					const runRemaining = runDeadlineAt === undefined ? undefined : Math.max(0, runDeadlineAt - Date.now());
-					// Only arm when the per-tool budget can fire strictly before the run
-					// deadline; otherwise the run-level timeout handles it (run budget
-					// wins, per spec).
-					if (runRemaining === undefined || toolTimeoutMs < runRemaining) {
-						const toolName = event.toolName;
-						toolTimeoutTimer = setTimeout(() => {
-							toolTimeoutTimer = undefined;
-							terminateForTimeout(`Tool '${toolName}' exceeded its timeout of ${toolTimeoutMs}ms.`);
-						}, toolTimeoutMs);
-						toolTimeoutTimer.unref?.();
-					}
-				}
+				armToolTimeout({ toolCallId: (event as { toolCallId?: unknown }).toolCallId, toolName: event.toolName });
 				if (event.toolName === "structured_output") {
 					structuredOutputToolInvoked = true;
 					structuredOutputMessageStartIndex = messages.length;
@@ -817,12 +804,47 @@ function runPiStreaming(
 			if (processTreeController) void processTreeController.terminate();
 			else trySignalChild(child, "SIGTERM");
 		};
-		let toolTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
-		const clearToolTimeoutTimer = (): void => {
-			if (toolTimeoutTimer) {
-				clearTimeout(toolTimeoutTimer);
-				toolTimeoutTimer = undefined;
-			}
+		let toolTimeoutSequence = 0;
+		const activeToolTimeouts = new Map<string, { toolName: string; timer: ReturnType<typeof setTimeout> }>();
+		const activeToolTimeoutKeysByName = new Map<string, string[]>();
+		const removeToolTimeoutKey = (key: string): void => {
+			const active = activeToolTimeouts.get(key);
+			if (!active) return;
+			clearTimeout(active.timer);
+			activeToolTimeouts.delete(key);
+			const keys = activeToolTimeoutKeysByName.get(active.toolName)?.filter((candidate) => candidate !== key) ?? [];
+			if (keys.length > 0) activeToolTimeoutKeysByName.set(active.toolName, keys);
+			else activeToolTimeoutKeysByName.delete(active.toolName);
+		};
+		const clearActiveToolTimeout = (event: { toolCallId?: unknown; toolName?: unknown }): void => {
+			const key = typeof event.toolCallId === "string" && event.toolCallId.length > 0
+				? `id:${event.toolCallId}`
+				: typeof event.toolName === "string"
+					? activeToolTimeoutKeysByName.get(event.toolName)?.[0]
+					: activeToolTimeouts.size === 1
+						? [...activeToolTimeouts.keys()][0]
+						: undefined;
+			if (key) removeToolTimeoutKey(key);
+		};
+		const clearAllToolTimeouts = (): void => {
+			for (const key of [...activeToolTimeouts.keys()]) removeToolTimeoutKey(key);
+		};
+		const armToolTimeout = (event: { toolCallId?: unknown; toolName: string }): void => {
+			const timeoutForTool = effectiveToolTimeoutMs(event.toolName, toolTimeoutMs);
+			if (timeoutForTool === undefined) return;
+			const runRemaining = runDeadlineAt === undefined ? undefined : Math.max(0, runDeadlineAt - Date.now());
+			if (runRemaining !== undefined && timeoutForTool >= runRemaining) return;
+			const key = toolTimeoutCallKey(event, ++toolTimeoutSequence);
+			const toolName = event.toolName;
+			const timer = setTimeout(() => {
+				removeToolTimeoutKey(key);
+				terminateForTimeout(formatToolTimeoutMessage(toolName, timeoutForTool));
+			}, timeoutForTool);
+			timer.unref?.();
+			activeToolTimeouts.set(key, { toolName, timer });
+			const keys = activeToolTimeoutKeysByName.get(toolName) ?? [];
+			keys.push(key);
+			activeToolTimeoutKeysByName.set(toolName, keys);
 		};
 		registerTimeout?.(() => terminateForTimeout(timeoutMessage ?? "Subagent timed out."));
 		registerStop?.(() => {
@@ -851,6 +873,7 @@ function runPiStreaming(
 			turnBudgetHardKillTimer.unref?.();
 		});
 		const clearDrainTimers = () => {
+			clearAllToolTimeouts();
 			if (finalDrainTimer) {
 				clearTimeout(finalDrainTimer);
 				finalDrainTimer = undefined;
@@ -1140,7 +1163,7 @@ interface SingleStepContext {
 	stopSignal?: AbortSignal;
 	timeoutMessage?: string;
 	stopMessage?: string;
-	/** Resolved opt-in per-tool-call timeout (ms) for this step; off when undefined. */
+	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
 	toolTimeoutMs?: number;
 	/** Effective step deadline (Date.now() + effective timeout) when a run budget exists. */
 	deadlineAt?: number;
@@ -2569,6 +2592,72 @@ async function runSubagent(
 	const activeLongRunningSteps = new Set<number>();
 	const mutatingFailureStates = initialStatusSteps.map(() => createMutatingFailureState());
 	const pendingToolResults: Array<{ tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined> = initialStatusSteps.map(() => undefined);
+	type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string; blocksSupervisor: boolean };
+	const activeToolCalls = initialStatusSteps.map(() => new Map<string, ActiveToolCall>());
+	const activeToolKeysByName = initialStatusSteps.map(() => new Map<string, string[]>());
+	const activeToolSequences = initialStatusSteps.map(() => 0);
+	const latestActiveToolCall = (flatIndex: number): ActiveToolCall | undefined => [...(activeToolCalls[flatIndex]?.values() ?? [])].sort((left, right) => right.startedAt - left.startedAt)[0];
+	const refreshStepCurrentTool = (flatIndex: number): void => {
+		const step = statusPayload.steps[flatIndex];
+		if (!step) return;
+		const active = latestActiveToolCall(flatIndex);
+		if (!active) {
+			delete step.currentTool;
+			delete step.currentToolArgs;
+			delete step.currentToolStartedAt;
+			delete step.currentPath;
+			return;
+		}
+		step.currentTool = active.tool;
+		step.currentToolArgs = active.args;
+		step.currentToolStartedAt = active.startedAt;
+		setOptionalProperty(step, "currentPath", active.path);
+	};
+	const recordActiveToolCall = (flatIndex: number, event: { toolCallId?: unknown; toolName: string }, input: { argsPreview: string; currentPath?: string; blocksSupervisor: boolean; now: number }): ActiveToolCall => {
+		const sequence = (activeToolSequences[flatIndex] ?? 0) + 1;
+		activeToolSequences[flatIndex] = sequence;
+		const key = toolTimeoutCallKey(event, sequence);
+		const active: ActiveToolCall = {
+			key,
+			tool: event.toolName,
+			args: input.argsPreview,
+			startedAt: input.now,
+			blocksSupervisor: input.blocksSupervisor,
+			...(input.currentPath !== undefined ? { path: input.currentPath } : {}),
+		};
+		activeToolCalls[flatIndex]?.set(key, active);
+		const keysByName = activeToolKeysByName[flatIndex];
+		const keys = keysByName?.get(active.tool) ?? [];
+		keys.push(key);
+		keysByName?.set(active.tool, keys);
+		refreshStepCurrentTool(flatIndex);
+		return active;
+	};
+	const removeActiveToolCallKey = (flatIndex: number, key: string): ActiveToolCall | undefined => {
+		const calls = activeToolCalls[flatIndex];
+		const active = calls?.get(key);
+		if (!active) return undefined;
+		calls?.delete(key);
+		const keysByName = activeToolKeysByName[flatIndex];
+		const keys = keysByName?.get(active.tool)?.filter((candidate) => candidate !== key) ?? [];
+		if (keys.length > 0) keysByName?.set(active.tool, keys);
+		else keysByName?.delete(active.tool);
+		return active;
+	};
+	const removeActiveToolCall = (flatIndex: number, event: { toolCallId?: unknown; toolName?: unknown }): ActiveToolCall | undefined => {
+		const calls = activeToolCalls[flatIndex];
+		const key = typeof event.toolCallId === "string" && event.toolCallId.length > 0
+			? `id:${event.toolCallId}`
+			: typeof event.toolName === "string"
+				? activeToolKeysByName[flatIndex]?.get(event.toolName)?.[0]
+				: calls?.size === 1
+					? [...calls.keys()][0]
+					: undefined;
+		return key ? removeActiveToolCallKey(flatIndex, key) : undefined;
+	};
+	const openToolAttentionTarget = (flatIndex: number, now: number): ActiveToolCall | undefined => [...(activeToolCalls[flatIndex]?.values() ?? [])]
+		.filter((active) => shouldEmitOpenToolAttention({ config: controlConfig, currentTool: active.tool, currentToolStartedAt: active.startedAt, now }))
+		.sort((left, right) => left.startedAt - right.startedAt)[0];
 	const supervisorAttentionSteps = new Map<number, ActivityState | undefined>();
 	const mutatingFailureWindowMs = 5 * 60_000;
 	const appendControlEvent = (event: ReturnType<typeof buildControlEvent>) => {
@@ -2608,6 +2697,34 @@ async function runSubagent(
 				: undefined;
 		currentActivityState = nextRunState;
 		setOptionalProperty(statusPayload, "activityState", nextRunState);
+	};
+	const maybeEmitOpenToolAttention = (flatIndex: number, now: number): boolean => {
+		const step = statusPayload.steps[flatIndex];
+		if (!step || step.status !== "running" || step.activityState === "needs_attention") return false;
+		const target = openToolAttentionTarget(flatIndex, now);
+		if (!target) return false;
+		const previous = step.activityState;
+		step.activityState = "needs_attention";
+		statusPayload.activityState = "needs_attention";
+		const toolDurationMs = Math.max(0, now - target.startedAt);
+		appendControlEvent(buildControlEvent(omitUndefinedProperties({
+			type: "needs_attention",
+			from: previous,
+			to: "needs_attention",
+			runId: id,
+			agent: step.agent,
+			index: flatIndex,
+			ts: now,
+			message: `${step.agent} has had tool '${target.tool}' open for ${Math.floor(toolDurationMs / 1000)}s`,
+			reason: "tool_open_threshold",
+			turns: step.turnCount,
+			tokens: step.tokens?.total,
+			toolCount: step.toolCount,
+			currentTool: target.tool,
+			currentToolDurationMs: toolDurationMs,
+			currentPath: target.path,
+		})));
+		return true;
 	};
 	const maybeEmitActiveLongRunning = (flatIndex: number, now: number): boolean => {
 		if (!controlConfig.enabled || activeLongRunningSteps.has(flatIndex)) return false;
@@ -2869,20 +2986,19 @@ async function runSubagent(
 		if (event.type === "tool_execution_start" && event.toolName) {
 			const mutates = isMutatingTool(event.toolName, event.args);
 			const currentPath = resolveCurrentPath(event.toolName, event.args);
+			const argsPreview = extractToolArgsPreview(event.args ?? {});
+			const blocksSupervisor = isBlockingSupervisorTool(event.toolName, event.args);
 			step.toolCount = (step.toolCount ?? 0) + 1;
 			const configuredToolBudget = flatSteps[flatIndex]?.toolBudget;
 			if (configuredToolBudget) {
 				step.toolBudget = toolBudgetState(configuredToolBudget, step.toolCount);
 				statusPayload.toolBudget = step.toolBudget;
 			}
-			step.currentTool = event.toolName;
-			step.currentToolArgs = extractToolArgsPreview(event.args ?? {});
-			step.currentToolStartedAt = now;
-			setOptionalProperty(step, "currentPath", currentPath);
+			recordActiveToolCall(flatIndex, { toolCallId: (event as { toolCallId?: unknown }).toolCallId, toolName: event.toolName }, { argsPreview, currentPath, blocksSupervisor, now });
 			pendingToolResults[flatIndex] = omitUndefinedProperties({ tool: event.toolName, path: currentPath, mutates, startedAt: now });
 			statusPayload.toolCount = (statusPayload.toolCount ?? 0) + 1;
 			syncTopLevelCurrentTool();
-			if (controlConfig.enabled && isBlockingSupervisorTool(event.toolName, event.args) && step.activityState !== "needs_attention") {
+			if (controlConfig.enabled && blocksSupervisor && step.activityState !== "needs_attention") {
 				const previous = step.activityState;
 				step.activityState = "needs_attention";
 				supervisorAttentionSteps.set(flatIndex, previous);
@@ -2907,16 +3023,15 @@ async function runSubagent(
 				})));
 			}
 		} else if (event.type === "tool_execution_end") {
-			if (step.currentTool) {
+			const endedTool = removeActiveToolCall(flatIndex, event);
+			if (endedTool) {
 				step.recentTools ??= [];
-				step.recentTools.push({ tool: step.currentTool, args: step.currentToolArgs || "", endMs: now });
+				step.recentTools.push({ tool: endedTool.tool, args: endedTool.args, endMs: now });
 			}
+			refreshStepCurrentTool(flatIndex);
 			const supervisorPreviousActivity = supervisorAttentionSteps.get(flatIndex);
-			const clearedSupervisorAttention = supervisorAttentionSteps.delete(flatIndex);
-			delete step.currentTool;
-			delete step.currentToolArgs;
-			delete step.currentToolStartedAt;
-			delete step.currentPath;
+			const stillBlockingSupervisor = [...(activeToolCalls[flatIndex]?.values() ?? [])].some((active) => active.blocksSupervisor);
+			const clearedSupervisorAttention = endedTool?.blocksSupervisor && !stillBlockingSupervisor ? supervisorAttentionSteps.delete(flatIndex) : false;
 			if (clearedSupervisorAttention && step.activityState === "needs_attention") {
 				setOptionalProperty(step, "activityState", supervisorPreviousActivity);
 				syncAggregateActivityState();
@@ -3036,6 +3151,8 @@ async function runSubagent(
 					})));
 					changed = true;
 				}
+			} else if (maybeEmitOpenToolAttention(index, now)) {
+				changed = true;
 			} else if (maybeEmitActiveLongRunning(index, now)) {
 				changed = true;
 			}
