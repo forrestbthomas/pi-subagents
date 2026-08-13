@@ -1586,8 +1586,8 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		let defaultToolTimeoutMs: number | undefined;
 		if (frontmatter.toolTimeoutMs !== undefined) {
 			const parsed = Number(frontmatter.toolTimeoutMs);
-			if (!Number.isInteger(parsed) || parsed <= 0) {
-				throw new Error(`Agent '${localName}' has invalid toolTimeoutMs frontmatter; expected a positive integer.`);
+			if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 2_147_483_647) {
+				throw new Error(`Agent '${localName}' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than 2147483647.`);
 			}
 			defaultToolTimeoutMs = parsed;
 		}

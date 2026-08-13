@@ -158,7 +158,7 @@ Optional per-tool-call deadline in milliseconds. It is **off by default**. When 
 
 The tool timer never extends the run-level deadline: when the remaining run budget is shorter, the ordinary run-level timeout wins. `contact_supervisor` and `intercom` are exempt because their legitimate purpose is to wait for a human or supervisor response. Use this only for wedge protection; an elapsed timeout is not a mutation-safe boundary.
 
-Composite async runs (async chains, parallel tasks, and scripted workflows) stay unbounded at the top level by design. Their runner children are bounded individually by their own agent or runner defaults, so this value does not cap them. Must be a positive integer no greater than `2147483647` (the largest delay a Node.js timer can honor, roughly 24.8 days); invalid or out-of-range values are ignored and the built-in defaults apply.
+Composite async runs (async chains, parallel tasks, and scripted workflows) stay unbounded at the top level by design. Their runner children are bounded individually by their own agent or runner defaults, so this value does not cap them. Must be a positive integer no greater than `2147483647` (the largest delay a Node.js timer can honor, roughly 24.8 days); invalid or out-of-range values are rejected with a visible error rather than silently ignored.
 
 ## `globalConcurrencyLimit`
 
