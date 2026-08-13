@@ -160,6 +160,24 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 		assert.ok(result.error?.includes("connection refused"));
 	});
 
+	it("kills a wedged foreground tool at the configured per-tool timeout", { skip: process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash")] },
+				{ delay: 30_000 },
+			],
+		});
+		const agents = makeAgentConfigs(["slow"]);
+
+		const result = await runSync(tempDir, agents, "slow", "Wait", {
+			toolTimeoutMs: 1_000,
+			timeoutMs: 8_000,
+		});
+
+		assert.equal(result.timedOut, true);
+		assert.match(result.error ?? "", /Tool 'bash' exceeded its timeout of 1000ms\./);
+	});
+
 	it("handles abort signal (completes faster than delay)", async () => {
 		mockPi.onCall({ delay: 10000 });
 		const agents = makeAgentConfigs(["slow"]);

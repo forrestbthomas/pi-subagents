@@ -41,6 +41,8 @@ export interface RunnerSubagentStep {
 	sessionFile?: string;
 	maxSubagentDepth?: number;
 	timeoutMs?: number;
+	/** Resolved opt-in per-tool-call timeout (ms). Off (undefined) by default. */
+	toolTimeoutMs?: number;
 	waitToolEnabled?: boolean;
 	structuredOutput?: {
 		schema: import("../../shared/types.ts").JsonSchemaObject;

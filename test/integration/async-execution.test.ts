@@ -1210,6 +1210,163 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.error, "Subagent timed out after 150ms.");
 	});
 
+	it("kills a wedged tool at the per-tool timeout with a tool-specific error before the run-level timeout", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		// Wedge: tool_execution_start fires, then the mock holds (long delay) so
+		// tool_execution_end never arrives — output would keep flowing in a real
+		// wedge, which is exactly why a run-level stall detector can't see it.
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash")] },
+				{ delay: 30_000 }, // hold far past the per-tool budget; no tool_execution_end
+			],
+		});
+		const id = `async-tool-timeout-${Date.now().toString(36)}`;
+		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "1000";
+		try {
+			executeAsyncChain(id, {
+				chain: [{ agent: "one", task: "Wait" }],
+				agents: [makeAgent("one")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				timeoutMs: 8_000, // run-level budget is longer; the per-tool timer must fire first
+			});
+
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.state, "failed");
+			assert.equal(payload.results[0]?.timedOut, true);
+			assert.match(payload.results[0]?.error ?? "", /Tool 'bash' exceeded its timeout of 1000ms\./);
+		} finally {
+			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
+		}
+	});
+
+	it("lets the shorter run-level deadline win over a per-tool timeout", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash")] },
+				{ delay: 30_000 },
+			],
+		});
+		const id = `async-tool-timeout-run-budget-${Date.now().toString(36)}`;
+		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "1000";
+		try {
+			executeAsyncChain(id, {
+				chain: [{ agent: "one", task: "Wait" }],
+				agents: [makeAgent("one")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				timeoutMs: 300,
+			});
+
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.results[0]?.timedOut, true);
+			assert.equal(payload.results[0]?.error, "Subagent timed out after 300ms.");
+		} finally {
+			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
+		}
+	});
+
+	it("does not kill a tool that completes before the per-tool timeout", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("bash"),
+				events.toolEnd("bash"),
+				events.assistantMessage("done"),
+				{ type: "agent_end", willRetry: false },
+				{ type: "agent_settled" },
+			],
+		});
+		const id = `async-tool-complete-${Date.now().toString(36)}`;
+		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "1000";
+		try {
+			executeAsyncChain(id, {
+				chain: [{ agent: "one", task: "Done" }],
+				agents: [makeAgent("one")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				timeoutMs: 8_000,
+			});
+
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.state, "complete");
+			assert.notEqual(payload.results[0]?.timedOut, true);
+		} finally {
+			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
+		}
+	});
+
+	it("does not apply the per-tool timeout to supervisor tools (contact_supervisor/intercom)", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		// contact_supervisor holds ~1.5s — longer than the 1s per-tool budget — but
+		// is allowlisted, so the per-tool timer must not fire.
+		mockPi.onCall({
+			steps: [
+				{
+					delay: 1500,
+					jsonl: [
+						events.toolStart("contact_supervisor"),
+						events.toolEnd("contact_supervisor"),
+						events.assistantMessage("done"),
+						{ type: "agent_end", willRetry: false },
+						{ type: "agent_settled" },
+					],
+				},
+			],
+		});
+		const id = `async-tool-allowlist-${Date.now().toString(36)}`;
+		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "1000";
+		try {
+			executeAsyncChain(id, {
+				chain: [{ agent: "one", task: "Ask" }],
+				agents: [makeAgent("one")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				timeoutMs: 8_000,
+			});
+
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.state, "complete");
+			assert.notEqual(payload.results[0]?.timedOut, true);
+		} finally {
+			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
+		}
+	});
+
 	it("enforces child timeouts on async parallel tasks without a composite deadline", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
 		mockPi.onCall({ delay: 5_000, output: "one too late" });
 		mockPi.onCall({ delay: 5_000, output: "two too late" });

@@ -53,12 +53,14 @@ import {
 } from "../../shared/utils.ts";
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
+import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { arbitrateCompletionGuardRescue } from "../shared/llm-intent-arbiter.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { resolvePermissionRules } from "../shared/permissions.ts";
+import { isToolTimeoutExempt } from "../shared/tool-timeout.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan, type SubagentTaskDelivery } from "../shared/pi-args.ts";
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV } from "../shared/capability-ceiling.ts";
@@ -892,6 +894,21 @@ async function runSingleAttempt(
 				const toolArgs = evt.args && typeof evt.args === "object" && !Array.isArray(evt.args)
 					? evt.args as Record<string, unknown>
 					: {};
+				clearToolTimeout();
+				if (options.toolTimeoutMs !== undefined && evt.toolName !== undefined && !isToolTimeoutExempt(evt.toolName)) {
+					const elapsed = Date.now() - startTime;
+					const runRemaining = attemptTimeout ? Math.max(0, attemptTimeout.remainingMs - elapsed) : undefined;
+					// Arm only when the per-tool budget fires strictly before the run
+					// deadline; otherwise the run-level timeout handles it.
+					if (runRemaining === undefined || options.toolTimeoutMs < runRemaining) {
+						const toolName = evt.toolName;
+						toolTimeoutTimer = setTimeout(() => {
+							toolTimeoutTimer = undefined;
+							terminateForToolTimeout(`Tool '${toolName}' exceeded its timeout of ${options.toolTimeoutMs}ms.`);
+						}, options.toolTimeoutMs);
+						toolTimeoutTimer.unref?.();
+					}
+				}
 				if (options.structuredOutput && evt.toolName === "structured_output") {
 					structuredOutputToolInvoked = true;
 					structuredOutputMessageStartIndex = result.messages?.length ?? 0;
@@ -914,6 +931,7 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "tool_execution_end") {
+				clearToolTimeout();
 				if (progress.currentTool) {
 					progress.recentTools.push({
 						tool: progress.currentTool,
@@ -1042,6 +1060,49 @@ async function runSingleAttempt(
 			}, attemptTimeout.remainingMs);
 			timeoutTimer.unref?.();
 		}
+
+		// Opt-in per-tool-call timeout (kill-run semantics): armed on
+		// tool_execution_start, cleared on tool_execution_end. On expiry the
+		// child is escalated exactly like the run-level timeout but with a
+		// tool-specific error so the harness can distinguish the wedge class.
+		let toolTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+		let toolTimeoutTerminationTimer: ReturnType<typeof setTimeout> | undefined;
+		let toolTimeoutHardKillTimer: ReturnType<typeof setTimeout> | undefined;
+		const clearToolTimeout = (): void => {
+			if (toolTimeoutTimer) {
+				clearTimeout(toolTimeoutTimer);
+				toolTimeoutTimer = undefined;
+			}
+			if (toolTimeoutTerminationTimer) {
+				clearTimeout(toolTimeoutTerminationTimer);
+				toolTimeoutTerminationTimer = undefined;
+			}
+			if (toolTimeoutHardKillTimer) {
+				clearTimeout(toolTimeoutHardKillTimer);
+				toolTimeoutHardKillTimer = undefined;
+			}
+		};
+		const terminateForToolTimeout = (message: string): void => {
+			if (processClosed || lifecycleFinished || interruptedByControl) return;
+			result.timedOut = true;
+			result.error = message;
+			result.finalOutput = message;
+			progress.status = "failed";
+			progress.error = message;
+			progress.durationMs = Date.now() - startTime;
+			fireUpdate();
+			trySignalChild(proc, "SIGINT");
+			toolTimeoutTerminationTimer = setTimeout(() => {
+				if (processClosed || lifecycleFinished) return;
+				trySignalChild(proc, "SIGTERM");
+			}, 1000);
+			toolTimeoutTerminationTimer.unref?.();
+			toolTimeoutHardKillTimer = setTimeout(() => {
+				if (processClosed || lifecycleFinished) return;
+				trySignalChild(proc, "SIGKILL");
+			}, 4000);
+			toolTimeoutHardKillTimer.unref?.();
+		};
 
 		const stderrTail = createBoundedByteTail();
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
@@ -1427,6 +1488,24 @@ async function runSyncCompletion(
 			error: acceptanceErrors.join(" "),
 		}, options.context));
 	}
+	const toolTimeout = resolveToolTimeoutMs({
+		callValue: options.toolTimeoutMs,
+		agentValue: agent.defaultToolTimeoutMs,
+		configValue: options.configToolTimeoutMs,
+		envValue: toolTimeoutFromEnv(),
+	});
+	if (toolTimeout.error) {
+		return redactResultPrompt(withRunContext({
+			index: options.index ?? 0,
+			agent: agentName,
+			task,
+			exitCode: 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: toolTimeout.error,
+		}, options.context));
+	}
+	options = { ...options, toolTimeoutMs: toolTimeout.toolTimeoutMs };
 	const outputModeValidationError = validateFileOnlyOutputMode(options.outputMode, options.outputPath, `Single run (${agentName})`);
 	if (outputModeValidationError) {
 		return redactResultPrompt(withRunContext({

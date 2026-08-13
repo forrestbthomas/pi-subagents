@@ -126,6 +126,7 @@ import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
+import { isToolTimeoutExempt } from "../shared/tool-timeout.ts";
 import { usageBudgetExceededMessage, usageBudgetState } from "../shared/usage-budget.ts";
 import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup, writePendingParallelHandoff } from "../shared/parallel-handoff.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
@@ -176,6 +177,8 @@ interface SubagentRunConfig {
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 	timeoutMs?: number;
 	deadlineAt?: number;
+	/** Resolved opt-in per-tool-call timeout (ms) for this run; off when undefined. */
+	toolTimeoutMs?: number;
 	turnBudget?: ResolvedTurnBudget;
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
@@ -541,6 +544,8 @@ function runPiStreaming(
 	stopMessage?: string,
 	registerTurnBudgetAbort?: (abort: ((message: string, state?: TurnBudgetState) => void) | undefined) => void,
 	onWriterProcess?: (writer: { state: "none" | "spawning" } | { state: "running"; pid: number }) => void,
+	toolTimeoutMs?: number,
+	runDeadlineAt?: number,
 ): Promise<RunPiStreamingResult> {
 	return new Promise((resolve) => {
 		const startedAt = Date.now();
@@ -674,8 +679,28 @@ function runPiStreaming(
 
 			onChildEvent?.(event);
 
+			if (event.type === "tool_execution_end") {
+				clearToolTimeoutTimer();
+				return;
+			}
+
 			if (event.type === "tool_execution_start" && event.toolName) {
 				toolCount += 1;
+				clearToolTimeoutTimer();
+				if (toolTimeoutMs !== undefined && !isToolTimeoutExempt(event.toolName)) {
+					const runRemaining = runDeadlineAt === undefined ? undefined : Math.max(0, runDeadlineAt - Date.now());
+					// Only arm when the per-tool budget can fire strictly before the run
+					// deadline; otherwise the run-level timeout handles it (run budget
+					// wins, per spec).
+					if (runRemaining === undefined || toolTimeoutMs < runRemaining) {
+						const toolName = event.toolName;
+						toolTimeoutTimer = setTimeout(() => {
+							toolTimeoutTimer = undefined;
+							terminateForTimeout(`Tool '${toolName}' exceeded its timeout of ${toolTimeoutMs}ms.`);
+						}, toolTimeoutMs);
+						toolTimeoutTimer.unref?.();
+					}
+				}
 				if (event.toolName === "structured_output") {
 					structuredOutputToolInvoked = true;
 					structuredOutputMessageStartIndex = messages.length;
@@ -781,14 +806,25 @@ function runPiStreaming(
 				if (!settled && !timedOut && !stopped) trySignalChild(child, "SIGTERM");
 			}, 1000).unref?.();
 		});
-		registerTimeout?.(() => {
+		const terminateForTimeout = (message: string): void => {
 			if (settled || timedOut || stopped) return;
 			timedOut = true;
+			// runPiStreaming's terminal result derives the timeout error from this
+			// message, so retain the tool-specific reason through finalization.
+			timeoutMessage = message;
 			interrupted = false;
-			error = timeoutMessage ?? "Subagent timed out.";
+			error = message;
 			if (processTreeController) void processTreeController.terminate();
 			else trySignalChild(child, "SIGTERM");
-		});
+		};
+		let toolTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+		const clearToolTimeoutTimer = (): void => {
+			if (toolTimeoutTimer) {
+				clearTimeout(toolTimeoutTimer);
+				toolTimeoutTimer = undefined;
+			}
+		};
+		registerTimeout?.(() => terminateForTimeout(timeoutMessage ?? "Subagent timed out."));
 		registerStop?.(() => {
 			if (settled || timedOut || stopped) return;
 			stopped = true;
@@ -1104,6 +1140,10 @@ interface SingleStepContext {
 	stopSignal?: AbortSignal;
 	timeoutMessage?: string;
 	stopMessage?: string;
+	/** Resolved opt-in per-tool-call timeout (ms) for this step; off when undefined. */
+	toolTimeoutMs?: number;
+	/** Effective step deadline (Date.now() + effective timeout) when a run budget exists. */
+	deadlineAt?: number;
 	turnBudget?: ResolvedTurnBudget;
 	childIntercomTarget?: string;
 	orchestratorIntercomTarget?: string;
@@ -1433,6 +1473,8 @@ async function runSingleStep(
 			ctx.stopMessage,
 			ctx.registerTurnBudgetAbort,
 			ctx.onWriterProcess,
+			ctx.toolTimeoutMs,
+			ctx.deadlineAt,
 		);
 		if (run.processCloseObservedAt !== undefined) {
 			writerProcesses.push({
@@ -1699,7 +1741,7 @@ async function runSingleStep(
 	const effectiveFinalError = stoppedAfterAcceptance
 		? ctx.stopMessage ?? "Subagent stopped by user."
 		: timedOutAfterAcceptance
-			? ctx.timeoutMessage ?? "Subagent timed out."
+			? finalResult?.error ?? ctx.timeoutMessage ?? "Subagent timed out."
 			: turnBudgetExceeded
 				? finalResult?.error ?? (turnBudget ? turnBudgetExceededMessage(turnBudget, turnBudget.turnCount) : "Subagent exceeded turn budget.")
 				: acceptanceCanFailRun
@@ -2008,6 +2050,7 @@ async function runSingleStepWithTimeout(
 		return await runSingleStep(step, {
 			...ctx,
 			registerTimeout,
+			deadlineAt: Date.now() + timeoutMs,
 			timeoutSignal: combinedAbortSignal([ctx.timeoutSignal, timeoutController.signal]),
 			timeoutMessage,
 		});
@@ -3555,6 +3598,7 @@ async function runSubagent(
 					timeoutMessage,
 					stopMessage,
 					turnBudget: config.turnBudget,
+					toolTimeoutMs: task.toolTimeoutMs ?? config.toolTimeoutMs,
 					onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
 					onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 					onWriterProcess,
@@ -3938,6 +3982,7 @@ async function runSubagent(
 							timeoutMessage,
 							stopMessage,
 							turnBudget: config.turnBudget,
+							toolTimeoutMs: taskForRun.toolTimeoutMs ?? config.toolTimeoutMs,
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 							onWriterProcess,
@@ -4228,6 +4273,7 @@ async function runSubagent(
 				timeoutMessage,
 				stopMessage,
 				turnBudget: config.turnBudget,
+				toolTimeoutMs: seqStep.toolTimeoutMs ?? config.toolTimeoutMs,
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
 				onWriterProcess,

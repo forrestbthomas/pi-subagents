@@ -148,6 +148,16 @@ Global default runtime deadline, in milliseconds, for subagent runs. It replaces
 
 Use it when foreground orchestration or plain async single-agent runs need a longer default than 30 minutes. It does not set async composite top-level deadlines, and it does not replace async fan-out child deadlines.
 
+## `toolTimeoutMs`
+
+```json
+{ "toolTimeoutMs": 600000 }
+```
+
+Optional per-tool-call deadline in milliseconds. It is **off by default**. When configured, a child that emits `tool_execution_start` but not `tool_execution_end` is terminated with `timedOut: true` and a tool-specific error. The effective value is resolved per child: explicit `subagent` call value, then agent frontmatter, then this config value, then `PI_SUBAGENT_TOOL_TIMEOUT_MS`.
+
+The tool timer never extends the run-level deadline: when the remaining run budget is shorter, the ordinary run-level timeout wins. `contact_supervisor` and `intercom` are exempt because their legitimate purpose is to wait for a human or supervisor response. Use this only for wedge protection; an elapsed timeout is not a mutation-safe boundary.
+
 Composite async runs (async chains, parallel tasks, and scripted workflows) stay unbounded at the top level by design. Their runner children are bounded individually by their own agent or runner defaults, so this value does not cap them. Must be a positive integer no greater than `2147483647` (the largest delay a Node.js timer can honor, roughly 24.8 days); invalid or out-of-range values are ignored and the built-in defaults apply.
 
 ## `globalConcurrencyLimit`

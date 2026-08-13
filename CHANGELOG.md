@@ -10,6 +10,7 @@
 - Inspect async run state with `debug.run`, without exposing prompts, secrets, or transcripts (#1037).
 - Let builtin role overrides keep Pi's normal tools and extensions with `tools: "inherit"`. Thanks to @estanexanavsem for #1047 and @davidarny for #1049.
 - Add simple terminal examples for FleetView, the async widget, and inline tool display. Thanks to @czottmann for #1050.
+- Add opt-in `toolTimeoutMs` per-tool-call deadlines with call → agent → config → environment precedence. A wedged tool now terminates the child with `timedOut: true`; supervisor waits (`contact_supervisor`, `intercom`) remain exempt and a shorter run-level deadline wins.
 
 ### Changed
 - Clean up active-run limits and artifact packaging code without changing behavior.

@@ -1767,6 +1767,10 @@ export interface RunSyncOptions {
 	interruptSignal?: AbortSignal;
 	timeoutMs?: number;
 	deadlineAt?: number;
+	/** Per-call per-tool timeout (ms), resolved with the agent/config/environment ladder at execution. */
+	toolTimeoutMs?: number;
+	/** Raw global config.toolTimeoutMs, used by the per-child resolver. */
+	configToolTimeoutMs?: number;
 	turnBudget?: ResolvedTurnBudget;
 	usageBudget?: UsageBudgetConfig;
 	/** Enforce maxTurns + graceTurns as a hard model-turn boundary. */
@@ -1940,6 +1944,15 @@ export interface ExtensionConfig {
 	 * Must be a positive integer; invalid values are ignored.
 	 */
 	timeoutMs?: number;
+	/**
+	 * Optional per-tool-call timeout in milliseconds (opt-in). Bounds a single
+	 * subagent tool call inside the child; the run-level timeout remains
+	 * authoritative. Off (undefined) by default so legit long or blocking tools
+	 * are unaffected. Precedence: call param > agent frontmatter > this config >
+	 * PI_SUBAGENT_TOOL_TIMEOUT_MS. Must be a positive integer; invalid values
+	 * are rejected with an error.
+	 */
+	toolTimeoutMs?: number;
 	control?: ControlConfig;
 	completionBatch?: CompletionBatchConfig;
 	turnBudget?: TurnBudgetConfig;
