@@ -1464,6 +1464,8 @@ export type AsyncJobStep = NonNullable<AsyncStatus["steps"]>[number] & {
 export interface AsyncJobState {
 	asyncId: string;
 	asyncDir: string;
+	/** Host tool-call id retained when it differs from the internal run id. */
+	toolCallId?: string;
 	/** Parent-resolved launch directory retained for trusted live artifact lookup. */
 	cwd?: string;
 	/** Parent-resolved child session root retained for trusted live transcript lookup. */
